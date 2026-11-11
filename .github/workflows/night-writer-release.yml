@@ -1,0 +1,303 @@
+name: Build Night Writer release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag (for example, v0.1.4)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: night-writer-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  SOURCE_ASSET: Night-Writer-Source.zip
+  UPDATE_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRDN0E2OTIwMzZFRTc3NUEKUldSYWQrNDJJR2w2VEc1KzVpUWl5VGRwZmo1L2ZhcE9qdGtQTGtrak1rYjk4djRUcnlLNTNiRDYK
+  UPDATE_FEED: https://github.com/HorrorOfMike/night-writer-release/releases/latest/download/latest.json
+
+jobs:
+  prepare:
+    # GitHub restricts draft releases to identities with push access.
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    outputs:
+      release_id: ${{ steps.source.outputs.release_id }}
+      source_id: ${{ steps.source.outputs.source_id }}
+    steps:
+      - name: Fetch source from the draft release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY,,}" != "horrorofmike/night-writer-release" || ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Run this in HorrorOfMike/night-writer-release with a numeric tag such as v0.1.4."
+            exit 1
+          fi
+          release=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -ce --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag and .draft)] |
+              if length == 1 then .[0] else error("Expected exactly one matching draft release") end')
+          release_id=$(jq -er '.id' <<< "$release")
+          source_id=$(jq -er --arg name "$SOURCE_ASSET" '
+            .assets | if length == 1 and .[0].name == $name and .[0].state == "uploaded"
+            then .[0].id else error("The draft must contain only Night-Writer-Source.zip") end' <<< "$release")
+          curl --fail --silent --show-error --location --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$source_id" -o source.zip
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "source_id=$source_id" >> "$GITHUB_OUTPUT"
+
+      - name: Check source ZIP layout
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import PurePosixPath
+          from stat import S_ISLNK
+          from zipfile import ZipFile
+
+          with ZipFile('source.zip') as source:
+              entries = source.infolist()
+              assert len(entries) <= 10000, 'Too many source ZIP entries'
+              assert sum(entry.file_size for entry in entries) <= 80 * 1024**2, 'Source ZIP is too large'
+              names = set()
+              for entry in entries:
+                  path = PurePosixPath(entry.filename)
+                  assert path.parts and path.parts[0] == 'Night-Writer', 'Expected a Night-Writer source folder'
+                  assert not any(part in ('..', '.git') or ':' in part for part in path.parts), entry.filename
+                  assert '\\' not in entry.filename and not S_ISLNK(entry.external_attr >> 16), entry.filename
+                  key = str(path).casefold()
+                  assert key not in names, f'Duplicate path: {entry.filename}'
+                  names.add(key)
+              assert {'night-writer/package.json', 'night-writer/package-lock.json',
+                      'night-writer/src-tauri/tauri.conf.json',
+                      'night-writer/src-tauri/cargo.toml'} <= names, 'Source ZIP is incomplete'
+              assert source.testzip() is None, 'Source ZIP checksum failed'
+          PY
+
+  build:
+    needs: prepare
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows
+            bundle: nsis
+            extension: exe
+          - runner: ubuntu-24.04
+            platform: linux
+            bundle: deb
+            extension: deb
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libssl-dev librsvg2-dev libxdo-dev patchelf
+
+      - name: Download and unpack the validated source asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ID: ${{ needs.prepare.outputs.source_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_ID" =~ ^[0-9]+$ ]]
+          curl --fail --silent --show-error --location --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ID" -o source.zip
+          python -m zipfile -e source.zip .
+
+      - name: Set release version and updater configuration
+        working-directory: Night-Writer
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version --ignore-scripts
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ['RELEASE_TAG'][1:]
+          for filename, pattern in [
+              ('Cargo.toml', r'(\[package\]\s*name\s*=\s*"night-writer"\s*version\s*=\s*")[^"]+'),
+              ('Cargo.lock', r'(\[\[package\]\]\s*name\s*=\s*"night-writer"\s*version\s*=\s*")[^"]+'),
+          ]:
+              path = Path('src-tauri', filename)
+              result, count = re.subn(pattern, lambda match: match[1] + version, path.read_text(encoding='utf-8'))
+              assert count == 1, f'Could not identify the app version in {filename}'
+              path.write_text(result, encoding='utf-8')
+          path = Path('src-tauri/tauri.conf.json')
+          config = json.loads(path.read_text(encoding='utf-8'))
+          assert config['identifier'] == 'com.michaelwhitehouse.nightwriter', 'Unexpected app identifier'
+          config['version'] = version
+          path.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+          overlay = {
+              'bundle': {'createUpdaterArtifacts': True},
+              'plugins': {'updater': {
+                  'pubkey': os.environ['UPDATE_PUBLIC_KEY'],
+                  'endpoints': [os.environ['UPDATE_FEED']],
+                  'requireSignedVersion': True,
+              }},
+          }
+          Path('updater.release.json').write_text(json.dumps(overlay) + '\n', encoding='utf-8')
+          PY
+
+      - name: Install JavaScript dependencies
+        working-directory: Night-Writer
+        run: npm ci
+
+      - name: Run frontend tests
+        if: runner.os == 'Linux'
+        working-directory: Night-Writer
+        run: npm test
+
+      - name: Build and sign installer
+        working-directory: Night-Writer
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::Add the existing Tauri private key as TAURI_SIGNING_PRIVATE_KEY."
+            exit 1
+          fi
+          npm run "package:$BUILD_PLATFORM" -- --config updater.release.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.platform }}
+          path: |
+            Night-Writer/src-tauri/target/release/bundle/${{ matrix.bundle }}/*.${{ matrix.extension }}
+            Night-Writer/src-tauri/target/release/bundle/${{ matrix.bundle }}/*.${{ matrix.extension }}.sig
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  stage-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: installers
+
+      - name: Verify signed installers and prepare upload names
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          version = os.environ['RELEASE_TAG'][1:]
+          staging = Path('staged')
+          staging.mkdir()
+          pubkey = staging / 'updater.pub'
+          pubkey.write_bytes(base64.b64decode(os.environ['UPDATE_PUBLIC_KEY'], validate=True))
+          for platform, ending in [('windows', '_x64-setup.exe'), ('linux', '_amd64.deb')]:
+              files = list(Path(f'installers/installer-{platform}').rglob(f'*_{version}{ending}'))
+              assert len(files) == 1, f'Expected one signed {platform} installer for {version}'
+              installer = files[0]
+              signature = installer.with_name(installer.name + '.sig').read_text(encoding='ascii').strip()
+              decoded = base64.b64decode(signature, validate=True)
+              trusted = next(line for line in decoded.decode().splitlines() if line.startswith('trusted comment:'))
+              fields = trusted.removeprefix('trusted comment: ').split('\t')
+              assert f'version:{version}' in fields and f'file:{installer.name}' in fields, 'Incorrect signature metadata'
+              raw = staging / 'verify.minisig'
+              raw.write_bytes(decoded)
+              subprocess.run(['minisign', '-V', '-m', str(installer), '-p', str(pubkey), '-x', str(raw)], check=True)
+              asset = staging / ('Night-Writer_' + version + ending)
+              shutil.copyfile(installer, asset)
+              asset.with_name(asset.name + '.sig').write_text(signature, encoding='ascii')
+          PY
+
+      - name: Attach verified installers and manifest to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          SOURCE_ID: ${{ needs.prepare.outputs.source_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg tag "$RELEASE_TAG" --argjson source "$SOURCE_ID" '
+            .draft and .tag_name == $tag and (.assets | length == 1 and .[0].id == $source)
+          ' <<< "$release" >/dev/null
+          jq -r '.body // ""' <<< "$release" > staged/notes.txt
+          upload_url=$(jq -er '.upload_url | split("{")[0]' <<< "$release")
+          if [[ "$upload_url" != "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" ]]; then
+            echo "::error::Unexpected release upload URL."
+            exit 1
+          fi
+          upload() {
+            local file="$1"
+            curl --fail-with-body --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
+              --data-binary "@$file" "$upload_url?name=${file##*/}"
+          }
+          version="${RELEASE_TAG#v}"
+          windows="staged/Night-Writer_${version}_x64-setup.exe"
+          linux="staged/Night-Writer_${version}_amd64.deb"
+          upload "$windows" > staged/windows.json
+          upload "$linux" > staged/linux.json
+          python - <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ['RELEASE_TAG'][1:]
+          stage = Path('staged')
+          platforms = {}
+          for platform, key, ending in [
+              ('windows', 'windows-x86_64-nsis', '_x64-setup.exe'),
+              ('linux', 'linux-x86_64-deb', '_amd64.deb'),
+          ]:
+              name = f'Night-Writer_{version}{ending}'
+              asset = json.loads((stage / f'{platform}.json').read_text())
+              assert asset['state'] == 'uploaded' and asset['size'] == (stage / name).stat().st_size
+              platforms[key] = {
+                  'url': asset['browser_download_url'],
+                  'signature': (stage / f'{name}.sig').read_text(),
+              }
+          feed = {
+              'version': version,
+              'pub_date': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+              'notes': (stage / 'notes.txt').read_text(encoding='utf-8').strip() or f'Night Writer {version}',
+              'platforms': platforms,
+          }
+          (stage / 'latest.json').write_text(json.dumps(feed, indent=2) + '\n', encoding='utf-8')
+          PY
+          upload staged/latest.json > staged/manifest.json
+          jq -e '.name == "latest.json" and .state == "uploaded"' staged/manifest.json >/dev/null
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ID"
+          echo "Both installers and latest.json are ready. Review and publish the draft as the latest release."
