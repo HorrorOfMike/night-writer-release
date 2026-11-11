@@ -274,6 +274,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          from urllib.parse import quote
 
           version = os.environ['RELEASE_TAG'][1:]
           stage = Path('staged')
@@ -286,7 +287,8 @@ jobs:
               asset = json.loads((stage / f'{platform}.json').read_text())
               assert asset['state'] == 'uploaded' and asset['size'] == (stage / name).stat().st_size
               platforms[key] = {
-                  'url': asset['browser_download_url'],
+                  'url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/"
+                         f"{os.environ['RELEASE_TAG']}/{quote(asset['name'], safe='')}",
                   'signature': (stage / f'{name}.sig').read_text(),
               }
           feed = {
